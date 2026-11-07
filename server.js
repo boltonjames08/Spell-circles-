@@ -1,5 +1,6 @@
-// The Cottage: tiny web server + WebSocket relay. No dependencies: run with `node server.js`.
-// The DM's browser runs each game session; this server only links browsers that share a session code.
+// The Spell Circle: spell papers, a voice call and a chat for D&D groups.
+// Tiny web server with no dependencies: run with `node server.js`. Sessions run here, on the server,
+// so nobody has to keep the page open.
 'use strict';
 const http = require('http');
 const fs = require('fs');
@@ -35,37 +36,24 @@ async function sendIce(res) {
   res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify({ iceServers: list }));
 }
 
+
 const PORT = Number(process.env.PORT) || 3000;
-const MAX_ROOMS = 300, MAX_PER_ROOM = 40, MAX_MSG = 2 * 1024 * 1024; // big enough for the shared Investigator's Book
-// Optional: extra ICE servers for voice (for example a TURN service), as JSON in the ICE_SERVERS setting.
-let ICE = null;
+const MAX_PER_ROOM = 40, MAX_MSG = 256 * 1024;
+let ICE = null; // optional extra voice servers as JSON in the ICE_SERVERS setting
 try { if (process.env.ICE_SERVERS) ICE = JSON.parse(process.env.ICE_SERVERS); } catch (e) { console.warn('ICE_SERVERS is not valid JSON, ignoring it'); }
 
-// the game page can live in public/index.html or right next to this file (either works)
-const PAGE_FILES = [path.join(__dirname, 'public', 'index.html'), path.join(__dirname, 'index.html'), path.join(__dirname, 'the-cottage.html')];
+// the page can live in public/index.html or right next to this file (either works)
+const PAGE_FILES = [path.join(__dirname, 'public', 'index.html'), path.join(__dirname, 'index.html'), path.join(__dirname, 'spells.html')];
 const pageFile = () => PAGE_FILES.find(f => fs.existsSync(f));
-// The Spell Circle (spell papers + voice call) lives at /spells
-const SPELL_FILES = [path.join(__dirname, 'public', 'spells.html'), path.join(__dirname, 'spells.html')];
-const spellFile = () => SPELL_FILES.find(f => fs.existsSync(f));
-const inject = html => html.replace('<head>', '<head><script>window.COTTAGE_RELAY=true;' + (ICE ? 'window.COTTAGE_ICE=' + JSON.stringify(ICE) + ';' : '') + '</script>');
 const page = () => fs.readFileSync(pageFile(), 'utf8')
-  .replace('<head>', '<head><script>window.COTTAGE_RELAY=true;' + (ICE ? 'window.COTTAGE_ICE=' + JSON.stringify(ICE) + ';' : '') + '</script>');
+  .replace('<head>', '<head><script>window.COTTAGE_RELAY=true;window.SPELLS_ONLY=true;' + (ICE ? 'window.COTTAGE_ICE=' + JSON.stringify(ICE) + ';' : '') + '</script>');
 
 const server = http.createServer((req, res) => {
   const url = (req.url || '/').split('?')[0];
   if (url === '/ice') return sendIce(res); // voice relay (TURN) settings for people whose network blocks direct voice
   if (url === '/healthz') { res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('ok'); }
-  if ((url === '/' || url === '/index.html') && !pageFile()) {
-    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    return res.end('The game page is missing. Upload index.html (from the zip) to your GitHub repository, next to server.js.');
-  }
-  if (url === '/spells' || url === '/spells/' || url === '/spells.html') {
-    if (!spellFile()) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('The Spell Circle page is missing. Upload spells.html to your GitHub repository, next to server.js.'); }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache',
-      'Permissions-Policy': 'microphone=(self)', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
-    return res.end(inject(fs.readFileSync(spellFile(), 'utf8')));
-  }
-  if (url === '/' || url === '/index.html') {
+  if (url === '/' || url === '/index.html' || url === '/spells') {
+    if (!pageFile()) { res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('The page is missing. Upload index.html to your GitHub repository, next to server.js.'); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache',
       'Permissions-Policy': 'microphone=(self)', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
     return res.end(page());
@@ -124,48 +112,11 @@ function accept(req, socket, onOpen) {
   onOpen(conn);
 }
 
-/* ---------- rooms: one DM (host) + players, keyed by session code ---------- */
-const rooms = new Map(); // code -> { host, conns:Set }
+
 server.on('upgrade', (req, socket) => {
   const u = new URL(req.url, 'http://x');
   if (u.pathname !== '/ws') return socket.destroy();
-  if (u.searchParams.get('app') === 'spells') return accept(req, socket, spConn); // The Spell Circle: hosted here
-  const code = String(u.searchParams.get('room') || '').toUpperCase();
-  const asHost = u.searchParams.get('host') === '1', key = String(u.searchParams.get('key') || '');
-  const rk = (u.searchParams.get('app') === 'spells' ? 'spells:' : '') + code; // The Cottage and The Spell Circle keep separate sessions
-  accept(req, socket, conn => {
-    const sys = (c, o) => c.send(JSON.stringify(o));
-    if (!/^[A-Z0-9]{3,12}$/.test(code)) { sys(conn, { sys: 'no-room' }); return conn.close(); }
-    let room = rooms.get(rk);
-    if (room && asHost && /^[a-z0-9]{8,40}$/.test(key) && room.key === key) { // the same DM coming back (e.g. a refresh): the old tab's session ends
-      room.dead = true; rooms.delete(rk);
-      for (const c of room.conns) { sys(c, { sys: c === room.host ? 'replaced' : 'host-gone' }); c.close(); }
-      room = null;
-    }
-    if (asHost) {
-      if (room) { sys(conn, { sys: 'host-taken' }); return conn.close(); }
-      if (rooms.size >= MAX_ROOMS) { sys(conn, { sys: 'full' }); return conn.close(); }
-      room = { host: conn, conns: new Set([conn]), key }; rooms.set(rk, room);
-    } else {
-      if (!room) { sys(conn, { sys: 'no-room' }); return conn.close(); }
-      if (room.conns.size >= MAX_PER_ROOM) { sys(conn, { sys: 'full' }); return conn.close(); }
-      room.conns.add(conn);
-    }
-    conn.onMessage = text => {
-      let d; try { d = JSON.parse(text); } catch (e) { return; }
-      if (!d || typeof d !== 'object' || Array.isArray(d)) return;
-      delete d.sys; delete d._h; d._c = conn.id;               // stamp the real sender; nobody can fake these
-      if (conn === room.host) d._h = 1;
-      const out = JSON.stringify(d);
-      for (const c of room.conns) if (c !== conn) c.send(out);
-    };
-    conn.onClose = () => {
-      if (room.dead) return;
-      room.conns.delete(conn);
-      if (conn === room.host) { for (const c of room.conns) { sys(c, { sys: 'host-gone' }); c.close(); } rooms.delete(rk); }
-      else if (room.host) sys(room.host, { sys: 'gone', _c: conn.id });
-    };
-  });
+  accept(req, socket, spConn);
 });
 
 /* =====================================================================================================
@@ -410,7 +361,5 @@ setInterval(() => { // keep connections alive (phones in the background still an
   }
 }, 25000);
 
-// keep connections alive through hosting proxies, and drop dead ones
-setInterval(() => { for (const r of rooms.values()) for (const c of r.conns) c.ping(); }, 25000);
 
-server.listen(PORT, () => console.log('The Cottage is running on port ' + PORT + (pageFile() ? ' (page: ' + path.relative(__dirname, pageFile()) + ')' : ' - WARNING: index.html not found')));
+server.listen(PORT, () => console.log('The Spell Circle is running on port ' + PORT + (pageFile() ? ' (page: ' + path.relative(__dirname, pageFile()) + ')' : ' - WARNING: index.html not found')));
