@@ -1,0 +1,10 @@
+{
+  "name": "the-spell-circle",
+  "version": "1.0.0",
+  "description": "Spell papers, a voice call and a chat for D&D groups.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "private": true
+}
